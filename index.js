@@ -666,4 +666,152 @@ client.on(Events.InteractionCreate, async (interaction) => {
         allow: [
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
-          Permission
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles
+        ]
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ManageChannels
+        ]
+      }
+    ];
+
+    for (const rid of config.staffRoles) {
+      overwrites.push({
+        id: rid,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageMessages
+        ]
+      });
+    }
+
+    const channel = await interaction.guild.channels.create({
+      name: `ticket-${interaction.user.username}`.toLowerCase().slice(0, 90),
+      type: ChannelType.GuildText,
+      parent: config.ticketCategory || interaction.channel.parentId || null,
+      permissionOverwrites: overwrites
+    });
+
+    activeTickets.set(channel.id, {
+      owner: interaction.user.id,
+      type,
+      createdAt: Date.now(),
+      claimedBy: null
+    });
+
+    config.stats.totalTickets++;
+    saveConfig();
+
+    const ticketEmbed = new EmbedBuilder()
+      .setTitle(`${data.emoji} ${data.label} Ticket`)
+      .setDescription(
+        `Merhaba <@${interaction.user.id}>! 👋\n\n` +
+        `**Kategori:** ${data.emoji} ${data.label}\n` +
+        `**Açan:** <@${interaction.user.id}>\n\n` +
+        `Lütfen talebini detaylı bir şekilde yaz. Yetkililer en kısa sürede ilgilenecek.`
+      )
+      .setColor(data.color)
+      .setTimestamp()
+      .setFooter({ text: 'Pangea Destek Sistemi' });
+
+    const claimBtn = new ButtonBuilder().setCustomId('ticket_claim').setLabel('Üstlen').setEmoji('✋').setStyle(ButtonStyle.Success);
+    const closeBtn = new ButtonBuilder().setCustomId('ticket_close').setLabel('Kapat').setEmoji('🔒').setStyle(ButtonStyle.Danger);
+
+    const row = new ActionRowBuilder().addComponents(claimBtn, closeBtn);
+
+    await channel.send({
+      content: `<@${interaction.user.id}>${config.staffRoles.map(r => ` <@&${r}>`).join('')}`,
+      embeds: [ticketEmbed],
+      components: [row]
+    });
+
+    sendLog(interaction.guild, new EmbedBuilder()
+      .setTitle('🎫 Yeni Ticket')
+      .setColor(0x57F287)
+      .addFields(
+        { name: 'Açan', value: `${interaction.user.tag}`, inline: true },
+        { name: 'Kategori', value: `${data.emoji} ${data.label}`, inline: true },
+        { name: 'Kanal', value: `<#${channel.id}>`, inline: true }
+      ).setTimestamp());
+
+    return interaction.editReply({ content: `✅ Ticket'ın oluşturuldu: <#${channel.id}>` });
+  }
+
+  if (!interaction.isButton()) return;
+
+  // -------- Ticket Kapat --------
+  if (interaction.customId === 'ticket_close') {
+    const ticket = activeTickets.get(interaction.channel.id);
+    if (!ticket) return interaction.reply({ content: '❌ Bu kanal ticket değil.', ephemeral: true });
+    if (ticket.owner !== interaction.user.id && !isStaff(interaction.member))
+      return interaction.reply({ content: '❌ Yetkin yok.', ephemeral: true });
+
+    await interaction.reply({
+      embeds: [new EmbedBuilder().setTitle('🔒 Kapatılıyor').setDescription('Transcript oluşturuluyor...').setColor(0xED4245)]
+    });
+
+    try {
+      const result = await createTranscript(interaction.channel);
+      if (result && config.transcriptChannel) {
+        const tCh = interaction.guild.channels.cache.get(config.transcriptChannel);
+        if (tCh) {
+          const att = new AttachmentBuilder(result.filePath, { name: result.fileName });
+          await tCh.send({
+            content: `📄 **${interaction.channel.name}** transcriptı (Kapatan: ${interaction.user.tag})`,
+            files: [att]
+          });
+        }
+      }
+      if (result) fs.unlink(result.filePath, () => {});
+    } catch (e) { console.error(e); }
+
+    config.stats.closedTickets++;
+    saveConfig();
+    activeTickets.delete(interaction.channel.id);
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+  }
+
+  // -------- Ticket Claim --------
+  if (interaction.customId === 'ticket_claim') {
+    const ticket = activeTickets.get(interaction.channel.id);
+    if (!ticket) return interaction.reply({ content: '❌ Bu kanal ticket değil.', ephemeral: true });
+    if (!isStaff(interaction.member))
+      return interaction.reply({ content: '❌ Sadece yetkililer üstlenebilir.', ephemeral: true });
+    if (ticket.claimedBy)
+      return interaction.reply({ content: `❌ Bu ticket zaten <@${ticket.claimedBy}> tarafından üstlenilmiş.`, ephemeral: true });
+
+    ticket.claimedBy = interaction.user.id;
+    config.stats.claims[interaction.user.id] = (config.stats.claims[interaction.user.id] || 0) + 1;
+    saveConfig();
+
+    return interaction.reply({ content: `✋ Ticket <@${interaction.user.id}> tarafından **üstlenildi**.` });
+  }
+
+  // -------- Değerlendirme (Yıldız) --------
+  if (interaction.customId.startsWith('rate_')) {
+    const puan = parseInt(interaction.customId.split('_')[1]);
+    const ticket = activeTickets.get(interaction.channel.id);
+    if (!ticket || !ticket.claimedBy)
+      return interaction.reply({ content: '❌ Değerlendirilecek yetkili yok.', ephemeral: true });
+
+    const staffId = ticket.claimedBy;
+    if (!config.stats.ratings[staffId]) config.stats.ratings[staffId] = { total: 0, count: 0 };
+    config.stats.ratings[staffId].total += puan;
+    config.stats.ratings[staffId].count += 1;
+    saveConfig();
+
+    return interaction.reply({ content: `⭐ Değerlendirmen için teşekkürler! **${puan}/5**`, ephemeral: true });
+  }
+});
+
+// ============================
+// GİRİŞ
+// ============================
+client.login(process.env.TOKEN);
